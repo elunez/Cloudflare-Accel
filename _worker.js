@@ -707,17 +707,28 @@ async function handleRequest(request, redirectCount = 0) {
   }
 
   const shouldProxyRedirects = isDockerRequest || isGitRequest || isGitHubHost(targetDomain);
-  const requestBody = ['GET', 'HEAD'].includes(request.method) ? undefined : await request.arrayBuffer();
+  const hasRequestBody = !['GET', 'HEAD'].includes(request.method);
   const newRequestHeaders = buildProxyHeaders(request.headers, targetUrl);
   let redirectAuthHeader = request.headers.get('Authorization');
   let currentMethod = request.method;
+  let replayBodyBufferPromise = null;
+
+  async function getReplayBodyBuffer() {
+    if (!hasRequestBody) {
+      return undefined;
+    }
+    if (!replayBodyBufferPromise) {
+      replayBodyBufferPromise = request.clone().arrayBuffer();
+    }
+    return replayBodyBufferPromise;
+  }
 
   try {
     // 尝试直接请求（注意：使用 manual 重定向以便我们能拦截到 307 并自己请求 S3）
     let response = await fetch(targetUrl, {
       method: request.method,
       headers: newRequestHeaders,
-      body: requestBody,
+      body: hasRequestBody ? request.body : undefined,
       redirect: 'manual'
     });
     console.log(`Initial response: ${response.status} ${response.statusText}`);
@@ -736,11 +747,12 @@ async function handleRequest(request, redirectCount = 0) {
             const authHeaders = buildProxyHeaders(request.headers, targetUrl);
             authHeaders.set('Authorization', `Bearer ${token}`);
             redirectAuthHeader = `Bearer ${token}`;
+            const retryBody = await getReplayBodyBuffer();
 
             const authRequest = new Request(targetUrl, {
               method: request.method,
               headers: authHeaders,
-              body: requestBody,
+              body: retryBody,
               redirect: 'manual'
             });
             console.log('Retrying with token');
@@ -751,11 +763,12 @@ async function handleRequest(request, redirectCount = 0) {
             const anonHeaders = buildProxyHeaders(request.headers, targetUrl);
             anonHeaders.delete('Authorization');
             redirectAuthHeader = null;
+            const retryBody = await getReplayBodyBuffer();
 
             const anonRequest = new Request(targetUrl, {
               method: request.method,
               headers: anonHeaders,
-              body: requestBody,
+              body: retryBody,
               redirect: 'manual'
             });
             response = await fetch(anonRequest);
@@ -785,7 +798,7 @@ async function handleRequest(request, redirectCount = 0) {
       console.log(`Redirect detected: ${resolvedRedirectUrl}`);
 
       const redirectMethod = getRedirectMethod(response.status, currentMethod);
-      const redirectBody = ['GET', 'HEAD'].includes(redirectMethod) ? undefined : requestBody;
+      const redirectBody = ['GET', 'HEAD'].includes(redirectMethod) ? undefined : await getReplayBodyBuffer();
       const redirectHeaders = buildProxyHeaders(request.headers, resolvedRedirectUrl);
       if (redirectAuthHeader) {
         redirectHeaders.set('Authorization', redirectAuthHeader);
