@@ -23,8 +23,12 @@ const ALLOWED_HOSTS = [
   'github.com',
   'api.github.com',
   'raw.githubusercontent.com',
+  'codeload.github.com',
   'gist.github.com',
-  'gist.githubusercontent.com'
+  'gist.githubusercontent.com',
+  'objects.githubusercontent.com',
+  'media.githubusercontent.com',
+  'release-assets.githubusercontent.com'
 ];
 
 // RESTRICT_PATHS: 控制是否限制 GitHub 和 Docker 请求的路径。
@@ -144,7 +148,6 @@ const HOMEPAGE_HTML = `
       background: #2d3748;
     }
 
-    /* 强制设置输入框样式 */
     input[type="text"] {
       background-color: white !important;
       color: #111827 !important;
@@ -211,8 +214,8 @@ const HOMEPAGE_HTML = `
 
     <!-- GitHub 链接转换 -->
     <div class="section-box">
-      <h2 class="text-xl font-semibold mb-2">⚡ GitHub 文件加速</h2>
-      <p class="text-gray-600 dark:text-gray-300 mb-4">输入 GitHub 文件链接，自动转换为加速链接。也可以直接在链接前加上本站域名使用。</p>
+      <h2 class="text-xl font-semibold mb-2">⚡ GitHub 文件与 Git Clone 加速</h2>
+      <p class="text-gray-600 dark:text-gray-300 mb-4">输入 GitHub 文件链接，自动转换为加速链接。Git 仓库也可直接使用 <code>git clone https://本站域名/github.com/user/repo.git</code> 或 <code>git clone https://本站域名/user/repo.git</code>。</p>
       <div class="flex gap-2 mb-2">
         <input
           id="github-url"
@@ -411,6 +414,31 @@ const HOMEPAGE_HTML = `
 </html>
 `;
 
+const DOCKER_HOSTS = [
+  'quay.io',
+  'gcr.io',
+  'k8s.gcr.io',
+  'registry.k8s.io',
+  'ghcr.io',
+  'docker.cloudsmith.io',
+  'registry-1.docker.io',
+  'docker.io'
+];
+
+const GITHUB_HOSTS = [
+  'github.com',
+  'api.github.com',
+  'raw.githubusercontent.com',
+  'codeload.github.com',
+  'gist.github.com',
+  'gist.githubusercontent.com',
+  'objects.githubusercontent.com',
+  'media.githubusercontent.com',
+  'release-assets.githubusercontent.com'
+];
+
+const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+
 async function handleToken(realm, service, scope) {
   const tokenUrl = `${realm}?service=${service}&scope=${scope}`;
   console.log(`Fetching token from: ${tokenUrl}`);
@@ -459,6 +487,45 @@ function getEmptyBodySHA256() {
   return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 }
 
+function isDockerHost(hostname) {
+  return DOCKER_HOSTS.includes(hostname);
+}
+
+function isGitHubHost(hostname) {
+  return GITHUB_HOSTS.includes(hostname);
+}
+
+function isGitSmartHttpRequest(request, path, search) {
+  const contentType = request.headers.get('Content-Type') || '';
+  return (
+    request.headers.has('Git-Protocol') ||
+    path.endsWith('/info/refs') ||
+    path.endsWith('/git-upload-pack') ||
+    path.endsWith('/git-receive-pack') ||
+    search.includes('service=git-upload-pack') ||
+    search.includes('service=git-receive-pack') ||
+    contentType.includes('application/x-git-')
+  );
+}
+
+function buildProxyHeaders(requestHeaders, targetUrl) {
+  const headers = new Headers(requestHeaders);
+  const target = new URL(targetUrl);
+
+  headers.set('Host', target.hostname);
+  headers.delete('x-amz-content-sha256');
+  headers.delete('x-amz-date');
+  headers.delete('x-amz-security-token');
+  headers.delete('x-amz-user-agent');
+
+  if (isAmazonS3(targetUrl)) {
+    headers.set('x-amz-content-sha256', getEmptyBodySHA256());
+    headers.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
+  }
+
+  return headers;
+}
+
 async function handleRequest(request, redirectCount = 0) {
   const MAX_REDIRECTS = 5; // 最大重定向次数
   const url = new URL(request.url);
@@ -501,6 +568,7 @@ async function handleRequest(request, redirectCount = 0) {
   }
 
   let targetDomain, targetPath, isDockerRequest = false;
+  const isGitRequest = isGitSmartHttpRequest(request, path, url.search);
 
   // 检查路径是否以 https:// 或 http:// 开头
   const fullPath = path.startsWith('/') ? path.substring(1) : path;
@@ -512,7 +580,7 @@ async function handleRequest(request, redirectCount = 0) {
     targetPath = urlObj.pathname.substring(1) + urlObj.search; // 移除开头的斜杠
 
     // 检查是否为 Docker 请求
-    isDockerRequest = ['quay.io', 'gcr.io', 'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io', 'registry-1.docker.io', 'docker.io'].includes(targetDomain);
+    isDockerRequest = isDockerHost(targetDomain);
 
     // 处理 docker.io 域名，转换为 registry-1.docker.io
     if (targetDomain === 'docker.io') {
@@ -536,7 +604,11 @@ async function handleRequest(request, redirectCount = 0) {
       // Docker 镜像仓库（如 ghcr.io）或 GitHub 域名（如 github.com）
       targetDomain = pathParts[0];
       targetPath = pathParts.slice(1).join('/') + url.search;
-      isDockerRequest = ['quay.io', 'gcr.io', 'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io', 'registry-1.docker.io'].includes(targetDomain);
+      isDockerRequest = isDockerHost(targetDomain);
+    } else if ((isGitRequest || pathParts.some(part => part.endsWith('.git'))) && pathParts.length >= 2) {
+      // 处理简写 GitHub 仓库路径，如 user/repo.git
+      targetDomain = 'github.com';
+      targetPath = pathParts.join('/') + url.search;
     } else if (pathParts.length >= 1 && pathParts[0] === 'library') {
       // 处理 library/nginx 格式
       isDockerRequest = true;
@@ -587,24 +659,16 @@ async function handleRequest(request, redirectCount = 0) {
     targetUrl = `https://${targetDomain}/${targetPath}`;
   }
 
-  const newRequestHeaders = new Headers(request.headers);
-  newRequestHeaders.set('Host', targetDomain);
-  newRequestHeaders.delete('x-amz-content-sha256');
-  newRequestHeaders.delete('x-amz-date');
-  newRequestHeaders.delete('x-amz-security-token');
-  newRequestHeaders.delete('x-amz-user-agent');
-
-  if (isAmazonS3(targetUrl)) {
-    newRequestHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
-    newRequestHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
-  }
+  const shouldProxyRedirects = isDockerRequest || isGitRequest || isGitHubHost(targetDomain);
+  const requestBody = ['GET', 'HEAD'].includes(request.method) ? undefined : await request.arrayBuffer();
+  const newRequestHeaders = buildProxyHeaders(request.headers, targetUrl);
 
   try {
     // 尝试直接请求（注意：使用 manual 重定向以便我们能拦截到 307 并自己请求 S3）
     let response = await fetch(targetUrl, {
       method: request.method,
       headers: newRequestHeaders,
-      body: request.body,
+      body: requestBody,
       redirect: 'manual'
     });
     console.log(`Initial response: ${response.status} ${response.statusText}`);
@@ -620,24 +684,13 @@ async function handleRequest(request, redirectCount = 0) {
 
           const token = await handleToken(realm, service || targetDomain, scope);
           if (token) {
-            const authHeaders = new Headers(request.headers);
+            const authHeaders = buildProxyHeaders(request.headers, targetUrl);
             authHeaders.set('Authorization', `Bearer ${token}`);
-            authHeaders.set('Host', targetDomain);
-            // 如果目标是 S3，添加必要的 x-amz 头；否则删除可能干扰的头部
-            if (isAmazonS3(targetUrl)) {
-              authHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
-              authHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
-            } else {
-              authHeaders.delete('x-amz-content-sha256');
-              authHeaders.delete('x-amz-date');
-              authHeaders.delete('x-amz-security-token');
-              authHeaders.delete('x-amz-user-agent');
-            }
 
             const authRequest = new Request(targetUrl, {
               method: request.method,
               headers: authHeaders,
-              body: request.body,
+              body: requestBody,
               redirect: 'manual'
             });
             console.log('Retrying with token');
@@ -645,24 +698,13 @@ async function handleRequest(request, redirectCount = 0) {
             console.log(`Token response: ${response.status} ${response.statusText}`);
           } else {
             console.log('No token acquired, falling back to anonymous request');
-            const anonHeaders = new Headers(request.headers);
+            const anonHeaders = buildProxyHeaders(request.headers, targetUrl);
             anonHeaders.delete('Authorization');
-            anonHeaders.set('Host', targetDomain);
-            // 如果目标是 S3，添加必要的 x-amz 头；否则删除可能干扰的头部
-            if (isAmazonS3(targetUrl)) {
-              anonHeaders.set('x-amz-content-sha256', getEmptyBodySHA256());
-              anonHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
-            } else {
-              anonHeaders.delete('x-amz-content-sha256');
-              anonHeaders.delete('x-amz-date');
-              anonHeaders.delete('x-amz-security-token');
-              anonHeaders.delete('x-amz-user-agent');
-            }
 
             const anonRequest = new Request(targetUrl, {
               method: request.method,
               headers: anonHeaders,
-              body: request.body,
+              body: requestBody,
               redirect: 'manual'
             });
             response = await fetch(anonRequest);
@@ -676,48 +718,51 @@ async function handleRequest(request, redirectCount = 0) {
       }
     }
 
-    // 处理 S3 重定向（Docker 镜像层）
-    if (isDockerRequest && (response.status === 307 || response.status === 302)) {
-      const redirectUrl = response.headers.get('Location');
-      if (redirectUrl) {
-        console.log(`Redirect detected: ${redirectUrl}`);
-        const EMPTY_BODY_SHA256 = getEmptyBodySHA256();
-        const redirectHeaders = new Headers(request.headers);
-        redirectHeaders.set('Host', new URL(redirectUrl).hostname);
-        
-        // 对于任何重定向，都添加必要的AWS头（如果需要）
-        if (isAmazonS3(redirectUrl)) {
-          redirectHeaders.set('x-amz-content-sha256', EMPTY_BODY_SHA256);
-          redirectHeaders.set('x-amz-date', new Date().toISOString().replace(/[-:T]/g, '').slice(0, -5) + 'Z');
-        }
-        
-        if (response.headers.get('Authorization')) {
-          redirectHeaders.set('Authorization', response.headers.get('Authorization'));
-        }
-
-        const redirectRequest = new Request(redirectUrl, {
-          method: request.method,
-          headers: redirectHeaders,
-          body: request.body,
-          redirect: 'manual'
-        });
-        response = await fetch(redirectRequest);
-        console.log(`Redirect response: ${response.status} ${response.statusText}`);
-
-        if (!response.ok) {
-          console.log('Redirect request failed, returning original redirect response');
-          return new Response(response.body, {
-            status: response.status,
-            headers: response.headers
-          });
-        }
+    // 对 Docker 和 GitHub/Git 请求递归代理重定向，确保客户端始终通过 Worker 访问
+    while (shouldProxyRedirects && REDIRECT_STATUS_CODES.has(response.status)) {
+      if (redirectCount >= MAX_REDIRECTS) {
+        console.log(`Too many redirects for ${targetUrl}`);
+        return new Response('Error: Too many redirects.\n', { status: 508 });
       }
+
+      const redirectUrl = response.headers.get('Location');
+      if (!redirectUrl) {
+        break;
+      }
+
+      const resolvedRedirectUrl = new URL(redirectUrl, targetUrl).toString();
+      console.log(`Redirect detected: ${resolvedRedirectUrl}`);
+
+      const redirectMethod = response.status === 303 ? 'GET' : request.method;
+      const redirectBody = ['GET', 'HEAD'].includes(redirectMethod) ? undefined : requestBody;
+      const redirectHeaders = buildProxyHeaders(request.headers, resolvedRedirectUrl);
+      const authHeader = newRequestHeaders.get('Authorization');
+      if (authHeader) {
+        redirectHeaders.set('Authorization', authHeader);
+      }
+
+      response = await fetch(resolvedRedirectUrl, {
+        method: redirectMethod,
+        headers: redirectHeaders,
+        body: redirectBody,
+        redirect: 'manual'
+      });
+      redirectCount += 1;
+      targetUrl = resolvedRedirectUrl;
+      console.log(`Redirect response: ${response.status} ${response.statusText}`);
     }
 
     // 复制响应并添加 CORS 头
     const newResponse = new Response(response.body, response);
     newResponse.headers.set('Access-Control-Allow-Origin', '*');
     newResponse.headers.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+    if (REDIRECT_STATUS_CODES.has(response.status)) {
+      const redirectUrl = response.headers.get('Location');
+      if (redirectUrl) {
+        const proxiedRedirectUrl = `${url.origin}/${new URL(redirectUrl, targetUrl).toString()}`;
+        newResponse.headers.set('Location', proxiedRedirectUrl);
+      }
+    }
     if (isDockerRequest) {
       newResponse.headers.set('Docker-Distribution-API-Version', 'registry/2.0');
       // 删除可能存在的重定向头，确保所有请求都通过Worker处理
