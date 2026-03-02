@@ -575,7 +575,8 @@ async function handleRequest(request, redirectCount = 0) {
 
   if (fullPath.startsWith('https://') || fullPath.startsWith('http://')) {
     // 处理 /https://domain.com/... 或 /http://domain.com/... 格式
-    const urlObj = new URL(fullPath);
+    const nestedUrl = `${fullPath}${url.search}`;
+    const urlObj = new URL(nestedUrl);
     targetDomain = urlObj.hostname;
     targetPath = urlObj.pathname.substring(1) + urlObj.search; // 移除开头的斜杠
 
