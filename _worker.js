@@ -214,8 +214,8 @@ const HOMEPAGE_HTML = `
 
     <!-- GitHub 链接转换 -->
     <div class="section-box">
-      <h2 class="text-xl font-semibold mb-2">⚡ GitHub 文件与 Git Clone 加速</h2>
-      <p class="text-gray-600 dark:text-gray-300 mb-4">输入 GitHub 文件链接，自动转换为加速链接。Git 仓库也可直接使用 <code>git clone https://本站域名/github.com/user/repo.git</code> 或 <code>git clone https://本站域名/user/repo.git</code>。</p>
+      <h2 class="text-xl font-semibold mb-2">⚡ GitHub 文件加速</h2>
+      <p class="text-gray-600 dark:text-gray-300 mb-4">输入 GitHub 文件链接，自动转换为加速链接。也可以直接在链接前加上本站域名使用。</p>
       <div class="flex gap-2 mb-2">
         <input
           id="github-url"
@@ -270,7 +270,8 @@ const HOMEPAGE_HTML = `
 
   <script>
     // 动态获取当前域名
-    const currentDomain = window.location.hostname;
+    const currentOrigin = window.location.origin;
+    let toastTimer = null;
 
     // 主题切换
     function toggleTheme() {
@@ -304,8 +305,12 @@ const HOMEPAGE_HTML = `
       toast.classList.remove(isError ? 'bg-green-500' : 'bg-red-500');
       toast.classList.add(isError ? 'bg-red-500' : 'bg-green-500');
       toast.classList.add('show');
-      setTimeout(() => {
+      if (toastTimer) {
+        clearTimeout(toastTimer);
+      }
+      toastTimer = setTimeout(() => {
         toast.classList.remove('show');
+        toastTimer = null;
       }, 3000);
     }
 
@@ -313,10 +318,7 @@ const HOMEPAGE_HTML = `
     function copyToClipboard(text) {
       // 尝试使用 navigator.clipboard API
       if (navigator.clipboard && window.isSecureContext) {
-        return navigator.clipboard.writeText(text).catch(err => {
-          console.error('Clipboard API failed:', err);
-          return false;
-        });
+        return navigator.clipboard.writeText(text);
       }
       // 后备方案：使用 document.execCommand
       const textarea = document.createElement('textarea');
@@ -356,7 +358,7 @@ const HOMEPAGE_HTML = `
       }
 
       // 保持现有格式：域名/https://原始链接
-      githubAcceleratedUrl = 'https://' + currentDomain + '/https://' + input.substring(8);
+      githubAcceleratedUrl = currentOrigin + '/https://' + input.substring(8);
       result.textContent = '加速链接: ' + githubAcceleratedUrl;
       result.classList.remove('hidden');
       buttons.classList.remove('hidden');
@@ -391,7 +393,7 @@ const HOMEPAGE_HTML = `
         buttons.classList.add('hidden');
         return;
       }
-      dockerCommand = 'docker pull ' + currentDomain + '/' + input;
+      dockerCommand = 'docker pull ' + window.location.host + '/' + input;
       result.textContent = '加速命令: ' + dockerCommand;
       result.classList.remove('hidden');
       buttons.classList.remove('hidden');
@@ -437,7 +439,29 @@ const GITHUB_HOSTS = [
   'release-assets.githubusercontent.com'
 ];
 
+const ALLOWED_HOST_SET = new Set(ALLOWED_HOSTS);
+const ALLOWED_PATHS_LOWER = ALLOWED_PATHS.map(path => path.toLowerCase());
+const DOCKER_HOST_SET = new Set(DOCKER_HOSTS);
+const GITHUB_HOST_SET = new Set(GITHUB_HOSTS);
 const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+const EMPTY_BODY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, HEAD, POST, OPTIONS',
+  'Access-Control-Allow-Headers': '*'
+};
+const HOP_BY_HOP_HEADERS = [
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'expect',
+  'content-length'
+];
 
 async function handleToken(realm, service, scope) {
   const tokenUrl = `${realm}?service=${service}&scope=${scope}`;
@@ -473,26 +497,17 @@ function isAmazonS3(url) {
   }
 }
 
-// 计算请求体的 SHA256 哈希值
-async function calculateSHA256(message) {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(message);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
 // 获取空请求体的 SHA256 哈希值
 function getEmptyBodySHA256() {
-  return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+  return EMPTY_BODY_SHA256;
 }
 
 function isDockerHost(hostname) {
-  return DOCKER_HOSTS.includes(hostname);
+  return DOCKER_HOST_SET.has(hostname);
 }
 
 function isGitHubHost(hostname) {
-  return GITHUB_HOSTS.includes(hostname);
+  return GITHUB_HOST_SET.has(hostname);
 }
 
 function isGitSmartHttpRequest(request, path, search) {
@@ -513,6 +528,7 @@ function buildProxyHeaders(requestHeaders, targetUrl) {
   const target = new URL(targetUrl);
 
   headers.set('Host', target.hostname);
+  HOP_BY_HOP_HEADERS.forEach(header => headers.delete(header));
   headers.delete('x-amz-content-sha256');
   headers.delete('x-amz-date');
   headers.delete('x-amz-security-token');
@@ -526,6 +542,27 @@ function buildProxyHeaders(requestHeaders, targetUrl) {
   return headers;
 }
 
+function createCorsResponse(body, init = {}) {
+  const response = new Response(body, init);
+  Object.entries(CORS_HEADERS).forEach(([key, value]) => response.headers.set(key, value));
+  return response;
+}
+
+function getRedirectMethod(status, method) {
+  if (status === 303 && method !== 'GET' && method !== 'HEAD') {
+    return 'GET';
+  }
+  if ((status === 301 || status === 302) && method === 'POST') {
+    return 'GET';
+  }
+  return method;
+}
+
+function isPathAllowed(pathname) {
+  const normalizedPath = pathname.toLowerCase();
+  return ALLOWED_PATHS_LOWER.some(pathSegment => normalizedPath.includes(pathSegment));
+}
+
 async function handleRequest(request, redirectCount = 0) {
   const MAX_REDIRECTS = 5; // 最大重定向次数
   const url = new URL(request.url);
@@ -534,11 +571,18 @@ async function handleRequest(request, redirectCount = 0) {
   // 记录请求信息
   console.log(`Request: ${request.method} ${path}`);
 
+  if (request.method === 'OPTIONS') {
+    return createCorsResponse(null, { status: 204 });
+  }
+
   // 首页路由
   if (path === '/' || path === '') {
-    return new Response(HOMEPAGE_HTML, {
+    return createCorsResponse(HOMEPAGE_HTML, {
       status: 200,
-      headers: { 'Content-Type': 'text/html' }
+      headers: {
+        'Content-Type': 'text/html',
+        'Cache-Control': 'public, max-age=3600'
+      }
     });
   }
 
@@ -564,7 +608,7 @@ async function handleRequest(request, redirectCount = 0) {
   // 提取目标域名和路径
   const pathParts = path.split('/').filter(part => part);
   if (pathParts.length < 1) {
-    return new Response('Invalid request: target domain or path required\n', { status: 400 });
+    return createCorsResponse('Invalid request: target domain or path required\n', { status: 400 });
   }
 
   let targetDomain, targetPath, isDockerRequest = false;
@@ -575,8 +619,13 @@ async function handleRequest(request, redirectCount = 0) {
 
   if (fullPath.startsWith('https://') || fullPath.startsWith('http://')) {
     // 处理 /https://domain.com/... 或 /http://domain.com/... 格式
-    const nestedUrl = `${fullPath}${url.search}`;
-    const urlObj = new URL(nestedUrl);
+    let urlObj;
+    try {
+      const nestedUrl = `${fullPath}${url.search}`;
+      urlObj = new URL(nestedUrl);
+    } catch {
+      return createCorsResponse('Error: Invalid target URL.\n', { status: 400 });
+    }
     targetDomain = urlObj.hostname;
     targetPath = urlObj.pathname.substring(1) + urlObj.search; // 移除开头的斜杠
 
@@ -601,7 +650,7 @@ async function handleRequest(request, redirectCount = 0) {
         // 处理 docker.io/amilys/embyserver 或 docker.io/library/nginx 格式
         targetPath = pathParts.slice(1).join('/');
       }
-    } else if (ALLOWED_HOSTS.includes(pathParts[0])) {
+    } else if (ALLOWED_HOST_SET.has(pathParts[0])) {
       // Docker 镜像仓库（如 ghcr.io）或 GitHub 域名（如 github.com）
       targetDomain = pathParts[0];
       targetPath = pathParts.slice(1).join('/') + url.search;
@@ -629,21 +678,18 @@ async function handleRequest(request, redirectCount = 0) {
   }
 
   // 默认白名单检查：只允许 ALLOWED_HOSTS 中的域名
-  if (!ALLOWED_HOSTS.includes(targetDomain)) {
+  if (!ALLOWED_HOST_SET.has(targetDomain)) {
     console.log(`Blocked: Domain ${targetDomain} not in allowed list`);
-    return new Response(`Error: Invalid target domain.\n`, { status: 400 });
+    return createCorsResponse('Error: Invalid target domain.\n', { status: 400 });
   }
 
   // 路径白名单检查（仅当 RESTRICT_PATHS = true 时）
   if (RESTRICT_PATHS) {
-    const checkPath = isDockerRequest ? targetPath : path;
+    const checkPath = targetPath || path;
     console.log(`Checking whitelist against path: ${checkPath}`);
-    const isPathAllowed = ALLOWED_PATHS.some(pathString =>
-      checkPath.toLowerCase().includes(pathString.toLowerCase())
-    );
-    if (!isPathAllowed) {
+    if (!isPathAllowed(checkPath)) {
       console.log(`Blocked: Path ${checkPath} not in allowed paths`);
-      return new Response(`Error: The path is not in the allowed paths.\n`, { status: 403 });
+      return createCorsResponse('Error: The path is not in the allowed paths.\n', { status: 403 });
     }
   }
 
@@ -663,6 +709,8 @@ async function handleRequest(request, redirectCount = 0) {
   const shouldProxyRedirects = isDockerRequest || isGitRequest || isGitHubHost(targetDomain);
   const requestBody = ['GET', 'HEAD'].includes(request.method) ? undefined : await request.arrayBuffer();
   const newRequestHeaders = buildProxyHeaders(request.headers, targetUrl);
+  let redirectAuthHeader = request.headers.get('Authorization');
+  let currentMethod = request.method;
 
   try {
     // 尝试直接请求（注意：使用 manual 重定向以便我们能拦截到 307 并自己请求 S3）
@@ -687,6 +735,7 @@ async function handleRequest(request, redirectCount = 0) {
           if (token) {
             const authHeaders = buildProxyHeaders(request.headers, targetUrl);
             authHeaders.set('Authorization', `Bearer ${token}`);
+            redirectAuthHeader = `Bearer ${token}`;
 
             const authRequest = new Request(targetUrl, {
               method: request.method,
@@ -701,6 +750,7 @@ async function handleRequest(request, redirectCount = 0) {
             console.log('No token acquired, falling back to anonymous request');
             const anonHeaders = buildProxyHeaders(request.headers, targetUrl);
             anonHeaders.delete('Authorization');
+            redirectAuthHeader = null;
 
             const anonRequest = new Request(targetUrl, {
               method: request.method,
@@ -723,7 +773,7 @@ async function handleRequest(request, redirectCount = 0) {
     while (shouldProxyRedirects && REDIRECT_STATUS_CODES.has(response.status)) {
       if (redirectCount >= MAX_REDIRECTS) {
         console.log(`Too many redirects for ${targetUrl}`);
-        return new Response('Error: Too many redirects.\n', { status: 508 });
+        return createCorsResponse('Error: Too many redirects.\n', { status: 508 });
       }
 
       const redirectUrl = response.headers.get('Location');
@@ -734,12 +784,17 @@ async function handleRequest(request, redirectCount = 0) {
       const resolvedRedirectUrl = new URL(redirectUrl, targetUrl).toString();
       console.log(`Redirect detected: ${resolvedRedirectUrl}`);
 
-      const redirectMethod = response.status === 303 ? 'GET' : request.method;
+      const redirectMethod = getRedirectMethod(response.status, currentMethod);
       const redirectBody = ['GET', 'HEAD'].includes(redirectMethod) ? undefined : requestBody;
       const redirectHeaders = buildProxyHeaders(request.headers, resolvedRedirectUrl);
-      const authHeader = newRequestHeaders.get('Authorization');
-      if (authHeader) {
-        redirectHeaders.set('Authorization', authHeader);
+      if (redirectAuthHeader) {
+        redirectHeaders.set('Authorization', redirectAuthHeader);
+      } else {
+        redirectHeaders.delete('Authorization');
+      }
+      if (!redirectBody) {
+        redirectHeaders.delete('Content-Length');
+        redirectHeaders.delete('Content-Type');
       }
 
       response = await fetch(resolvedRedirectUrl, {
@@ -750,13 +805,12 @@ async function handleRequest(request, redirectCount = 0) {
       });
       redirectCount += 1;
       targetUrl = resolvedRedirectUrl;
+      currentMethod = redirectMethod;
       console.log(`Redirect response: ${response.status} ${response.statusText}`);
     }
 
     // 复制响应并添加 CORS 头
-    const newResponse = new Response(response.body, response);
-    newResponse.headers.set('Access-Control-Allow-Origin', '*');
-    newResponse.headers.set('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+    const newResponse = createCorsResponse(response.body, response);
     if (REDIRECT_STATUS_CODES.has(response.status)) {
       const redirectUrl = response.headers.get('Location');
       if (redirectUrl) {
@@ -772,7 +826,7 @@ async function handleRequest(request, redirectCount = 0) {
     return newResponse;
   } catch (error) {
     console.log(`Fetch error: ${error.message}`);
-    return new Response(`Error fetching from ${targetDomain}: ${error.message}\n`, { status: 500 });
+    return createCorsResponse(`Error fetching from ${targetDomain}: ${error.message}\n`, { status: 500 });
   }
 }
 
